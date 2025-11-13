@@ -1,0 +1,163 @@
+name: Build, Push Docker Image, Deploy via Portainer & Cleanup ACR
+
+# ────────────────────────────────────────────────
+# WORKFLOW TRIGGERS
+# ────────────────────────────────────────────────
+on:
+  workflow_dispatch:     # Manual trigger
+  push:
+    branches:
+      - main
+      - staging          # Add more branches if needed
+
+# ────────────────────────────────────────────────
+# SHARED WORKFLOW VARIABLES (EDIT PER PROJECT)
+# ────────────────────────────────────────────────
+env:
+  IMAGE_NAME: <docker-image-name>        # e.g. "myapp-backend"
+  TAG_LIMIT: 10                          # Number of tags to keep in ACR
+
+# ────────────────────────────────────────────────
+# 1. DETECT CHANGES TO REBUILD IMAGE
+# ────────────────────────────────────────────────
+jobs:
+  changes:
+    # Change this runner if needed (self-hosted or GitHub-hosted)
+    runs-on: <runner-label>              # e.g. ubuntu-latest OR self-hosted
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect changes that require rebuild
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docker:
+              - 'Dockerfile'
+              - 'docker-compose.yml'
+              - 'pyproject.toml'
+              - 'poetry.lock'
+              - 'uv.lock'
+              - 'startup_script.sh'
+              - 'app/**'
+              - 'README.md'
+
+# ────────────────────────────────────────────────
+# 2. BUILD & PUSH IMAGE TO ACR
+# ────────────────────────────────────────────────
+  build-and-push:
+    needs: changes
+    if: needs.changes.outputs.docker == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: <runner-label>              # e.g. ubuntu-latest OR self-hosted
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate image tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          TAG="${GITHUB_REF_NAME}-${SHORT_SHA}"
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Generated tag: $TAG"
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}    # *.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build & Push Docker Image
+        run: |
+          IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}"
+          TAG="${{ steps.meta.outputs.image_tag }}"
+
+          echo "Building image: $IMAGE:$TAG"
+          docker build -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+
+          echo "Pushing image $TAG..."
+          docker push "$IMAGE:$TAG"
+
+          echo "Pushing image latest..."
+          docker push "$IMAGE:latest"
+
+# ────────────────────────────────────────────────
+# 3. DEPLOY USING PORTAINER WEBHOOKS (WITH TAG)
+# ────────────────────────────────────────────────
+  trigger-deployment:
+    name: Deploy via Portainer Webhook
+    needs: build-and-push
+    runs-on: <runner-label>
+    if: needs.build-and-push.result == 'success'
+
+    steps:
+      - name: Call Portainer webhook with tag
+        run: |
+          TAG=${{ needs.build-and-push.outputs.image_tag }}
+
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "Production deployment"
+            WEBHOOK_URL="${{ secrets.PORTAINER_PROD_WEBHOOK }}"
+          else
+            echo "Staging deployment"
+            WEBHOOK_URL="${{ secrets.PORTAINER_STAGING_WEBHOOK }}"
+          fi
+
+          echo "Triggering deploy with tag: $TAG"
+          curl -X POST "${WEBHOOK_URL}?SERVICE_TAG_BE=${TAG}"
+
+# ────────────────────────────────────────────────
+# 4. CLEAN UP OLD ACR TAGS TO SAVE SPACE
+# ────────────────────────────────────────────────
+  cleanup-old-images:
+    name: Cleanup old ACR image tags
+    needs: build-and-push
+    runs-on: <runner-label>
+    container:
+      image: mcr.microsoft.com/azure-cli
+    if: needs.build-and-push.result == 'success'
+
+    steps:
+      - name: Install jq
+        run: |
+          tdnf makecache
+          tdnf install -y jq
+
+      - name: Remove old tags from ACR
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+
+        run: |
+          echo "Fetching tags for cleanup..."
+
+          TAGS=$(az acr repository show-tags \
+            --name $ACR_NAME \
+            --repository ${{ env.IMAGE_NAME }} \
+            --orderby time_desc \
+            --username $ACR_USERNAME \
+            --password $ACR_PASSWORD \
+            -o tsv)
+
+          COUNT=0
+          for TAG in $TAGS; do
+            COUNT=$((COUNT+1))
+            if [ $COUNT -gt $TAG_LIMIT ]; then
+              echo "Deleting old tag: $TAG"
+              az acr repository delete \
+                --name $ACR_NAME \
+                --image ${{ env.IMAGE_NAME }}:$TAG \
+                --username $ACR_USERNAME \
+                --password $ACR_PASSWORD \
+                --yes
+            fi
+          done
+
+          echo "Cleanup complete — kept last $TAG_LIMIT tags."
