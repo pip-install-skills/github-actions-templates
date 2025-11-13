@@ -1,0 +1,180 @@
+name: Build, Push Docker Images, Cleanup ACR & Deploy to Azure Container Apps
+
+# ────────────────────────────────────────────────
+# TRIGGER OPTIONS
+# ────────────────────────────────────────────────
+on:
+  workflow_dispatch:   # Manual trigger
+  push:
+    branches:
+      - main
+      - staging        # Add more if needed
+
+# ────────────────────────────────────────────────
+# SHARED ENVIRONMENT VARIABLES (EDIT PER PROJECT)
+# ────────────────────────────────────────────────
+env:
+  FRONTEND_IMAGE_NAME: <frontend-image-name>   # e.g., myapp-frontend
+  BACKEND_IMAGE_NAME: <backend-image-name>     # e.g., myapp-backend
+  TAG_LIMIT: 10                                # How many tags to keep in ACR
+
+# ────────────────────────────────────────────────
+# 1. DETECT CHANGES
+# ────────────────────────────────────────────────
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Track file changes for Docker build
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docker:
+              - 'Dockerfile.frontend'
+              - 'Dockerfile.backend'
+              - 'app/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'README.md'
+
+# ────────────────────────────────────────────────
+# 2. BUILD & PUSH IMAGES TO ACR
+# ────────────────────────────────────────────────
+  build-and-push:
+    needs: changes
+    if: needs.changes.outputs.docker == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate Image Tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${GITHUB_SHA}" | cut -c1-7)
+          TAG="${GITHUB_REF_NAME}-${SHORT_SHA}"
+          echo "image_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Generated tag: $TAG"
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }} # must be "*.azurecr.io"
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # ───────────────────────────────
+      # FRONTEND IMAGE
+      # ───────────────────────────────
+      - name: Build & Push Frontend Image
+        run: |
+          IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.FRONTEND_IMAGE_NAME }}"
+          TAG="${{ steps.meta.outputs.image_tag }}"
+
+          docker build -f Dockerfile.frontend -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+
+      # ───────────────────────────────
+      # BACKEND IMAGE
+      # ───────────────────────────────
+      - name: Build & Push Backend Image
+        run: |
+          IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.BACKEND_IMAGE_NAME }}"
+          TAG="${{ steps.meta.outputs.image_tag }}"
+
+          docker build -f Dockerfile.backend -t "$IMAGE:$TAG" -t "$IMAGE:latest" .
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:latest"
+
+# ────────────────────────────────────────────────
+# 3. CLEAN UP OLD ACR TAGS
+# ────────────────────────────────────────────────
+  cleanup-old-images:
+    name: Cleanup Old ACR Tags
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/azure-cli
+    if: needs.build-and-push.result == 'success'
+
+    steps:
+      - name: Install jq
+        run: |
+          tdnf makecache
+          tdnf install -y jq
+
+      - name: Remove old tags
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          FRONTEND: ${{ env.FRONTEND_IMAGE_NAME }}
+          BACKEND: ${{ env.BACKEND_IMAGE_NAME }}
+          LIMIT: ${{ env.TAG_LIMIT }}
+
+        run: |
+          for IMAGE_NAME in $FRONTEND $BACKEND; do
+            echo "Cleaning tags for $IMAGE_NAME..."
+            TAGS=$(az acr repository show-tags \
+              --name "$ACR_NAME" \
+              --repository "$IMAGE_NAME" \
+              --orderby time_desc \
+              --username "$ACR_USERNAME" \
+              --password "$ACR_PASSWORD" \
+              -o tsv)
+
+            COUNT=0
+            for TAG in $TAGS; do
+              COUNT=$((COUNT+1))
+              if [ "$COUNT" -gt "$LIMIT" ]; then
+                echo "Deleting old tag: $IMAGE_NAME:$TAG"
+                az acr repository delete \
+                  --name "$ACR_NAME" \
+                  --image "$IMAGE_NAME:$TAG" \
+                  --username "$ACR_USERNAME" \
+                  --password "$ACR_PASSWORD" \
+                  --yes
+              fi
+            done
+          done
+
+# ────────────────────────────────────────────────
+# 4. DEPLOY TO AZURE CONTAINER APPS
+# ────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Azure Container Apps
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: needs.build-and-push.result == 'success'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}   # Service principal JSON
+
+      # BACKEND DEPLOY
+      - name: Deploy Backend
+        run: |
+          az containerapp update \
+            --name ${{ secrets.AZ_BACKEND_APP }} \
+            --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.BACKEND_IMAGE_NAME }}:latest
+
+      # FRONTEND DEPLOY
+      - name: Deploy Frontend
+        run: |
+          az containerapp update \
+            --name ${{ secrets.AZ_FRONTEND_APP }} \
+            --resource-group ${{ secrets.AZ_RESOURCE_GROUP }} \
+            --image ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.FRONTEND_IMAGE_NAME }}:latest
